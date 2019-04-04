@@ -5,9 +5,24 @@
 
 
 cmake_minimum_required(VERSION 2.8.12)
+
+if(POLICY CMP0048)
+   cmake_policy(SET CMP0048 NEW)
+endif()
+
 project(dlib)
 
-message(STATUS "Using CMake version: ${CMAKE_VERSION}")
+set(CPACK_PACKAGE_NAME "dlib")
+set(CPACK_PACKAGE_VERSION_MAJOR "19")
+set(CPACK_PACKAGE_VERSION_MINOR "17")
+set(CPACK_PACKAGE_VERSION_PATCH "99")
+set(VERSION ${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH})
+# Only print these messages once, even if dlib is added multiple times via add_subdirectory()
+if (NOT TARGET dlib)
+   message(STATUS "Using CMake version: ${CMAKE_VERSION}")
+   message(STATUS "Compiling dlib version: ${VERSION}")
+endif()
+
 
 include(cmake_utils/set_compiler_specific_options.cmake)
 
@@ -15,15 +30,19 @@ include(cmake_utils/set_compiler_specific_options.cmake)
 # Adhere to GNU filesystem layout conventions
 include(GNUInstallDirs)
 
+if (POLICY CMP0063)
+   # This policy tells cmake to really honor CXX_VISIBILITY_PRESET rather than
+   # ignore it for backwards compatibility.
+   cmake_policy(SET CMP0063 NEW)
+endif()
+if (POLICY CMP0075)
+   cmake_policy(SET CMP0075 NEW)
+endif()
+
 # default to a Release build (except if CMAKE_BUILD_TYPE is set)
 include(cmake_utils/release_build_by_default)
 include(cmake_utils/use_cpp_11.cmake)
 
-
-set(CPACK_PACKAGE_VERSION_MAJOR "19")
-set(CPACK_PACKAGE_VERSION_MINOR "10")
-set(CPACK_PACKAGE_VERSION_PATCH "99")
-set(VERSION ${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH})
 # Set DLIB_VERSION in the including CMake file so they can use it to do whatever they want. 
 get_directory_property(has_parent PARENT_DIRECTORY)
 if(has_parent)
@@ -33,6 +52,17 @@ if(has_parent)
    endif()
 endif()
 
+if (COMMAND pybind11_add_module AND MSVC)
+   # True when building a python extension module using Visual Studio.  We care
+   # about this because a huge number of windows users have broken systems, and
+   # in particular, they have broken or incompatibly installed copies of things
+   # like libjpeg or libpng.  So if we detect we are in this mode we will never
+   # ever link to those libraries.  Instead, we link to the copy included with
+   # dlib.
+   set (BUILDING_PYTHON_IN_MSVC true)
+else()
+   set (BUILDING_PYTHON_IN_MSVC false)
+endif()
 
 if (DLIB_IN_PROJECT_BUILD)
 
@@ -69,6 +99,11 @@ if (DLIB_IN_PROJECT_BUILD)
 
    # Tell cmake to build dlib as a static library
    set(BUILD_SHARED_LIBS false)
+
+elseif(BUILD_SHARED_LIBS)
+   if (MSVC)
+      message(FATAL_ERROR "Building dlib as a standalone dll is not supported when using Visual Studio.  You are highly encouraged to use static linking instead.  See https://github.com/davisking/dlib/issues/1483 for a discussion.") 
+   endif()
 endif()
 
 
@@ -130,6 +165,10 @@ if (NOT TARGET dlib)
       "Disable this if you don't want to use a LAPACK library" )
    set (DLIB_USE_CUDA_STR
       "Disable this if you don't want to use NVIDIA CUDA" )
+   set (DLIB_USE_MKL_SEQUENTIAL_STR
+      "Enable this if you have MKL installed and want to use the sequential version instead of the multi-core version." )
+   set (DLIB_USE_MKL_WITH_TBB_STR
+      "Enable this if you have MKL installed and want to use the tbb version instead of the openmp version." )
    set (DLIB_PNG_SUPPORT_STR
       "Disable this if you don't want to link against libpng" )
    set (DLIB_GIF_SUPPORT_STR
@@ -152,6 +191,8 @@ if (NOT TARGET dlib)
    toggle_preprocessor_switch(DLIB_NO_GUI_SUPPORT)
    option(DLIB_ENABLE_STACK_TRACE ${DLIB_ENABLE_STACK_TRACE_STR} OFF)
    toggle_preprocessor_switch(DLIB_ENABLE_STACK_TRACE)
+   option(DLIB_USE_MKL_SEQUENTIAL ${DLIB_USE_MKL_SEQUENTIAL_STR} OFF)
+   option(DLIB_USE_MKL_WITH_TBB ${DLIB_USE_MKL_WITH_TBB_STR} OFF)
 
    if(DLIB_ENABLE_ASSERTS)
       # Set these variables so they are set in the config.h.in file when dlib
@@ -230,6 +271,7 @@ if (NOT TARGET dlib)
       global_optimization/global_function_search.cpp
       filtering/kalman_filter.cpp
       test_for_odr_violations.cpp
+      svm/auto.cpp
       )
 
 
@@ -388,15 +430,8 @@ if (NOT TARGET dlib)
       endif()
 
       if (DLIB_PNG_SUPPORT)
-         # try to find libpng 
-         find_package(PNG QUIET)
-         # Make sure there isn't something wrong with the version of LIBPNG
-         # installed on this system.  
+         include(cmake_utils/find_libpng.cmake)
          if (PNG_FOUND)
-            set(CMAKE_REQUIRED_LIBRARIES ${PNG_LIBRARIES})
-            CHECK_FUNCTION_EXISTS(png_create_read_struct LIBPNG_IS_GOOD)
-         endif()
-         if (PNG_FOUND AND LIBPNG_IS_GOOD)
             include_directories(${PNG_INCLUDE_DIR})
             set (dlib_needed_libraries ${dlib_needed_libraries} ${PNG_LIBRARIES})
             set(REQUIRES_LIBS " libpng")
@@ -404,6 +439,8 @@ if (NOT TARGET dlib)
             # If we can't find libpng then statically compile it in.
             include_directories(external/libpng external/zlib)
             set(source_files ${source_files}
+               external/libpng/arm/arm_init.c
+               external/libpng/arm/filter_neon_intrinsics.c
                external/libpng/png.c
                external/libpng/pngerror.c
                external/libpng/pngget.c
@@ -456,16 +493,8 @@ if (NOT TARGET dlib)
       endif()
 
       if (DLIB_JPEG_SUPPORT)
-         # try to find libjpeg 
-         find_package(JPEG QUIET)
-         # Make sure there isn't something wrong with the version of libjpeg 
-         # installed on this system.  Also don't use the installed libjpeg
-         # if this is an APPLE system because apparently it's broken (as of 2015/01/01).
-         if (JPEG_FOUND AND NOT ("${JPEG_INCLUDE_DIR}" MATCHES "(.*)(Ana|ana|mini)conda(.*)"))
-            set(CMAKE_REQUIRED_LIBRARIES ${JPEG_LIBRARY})
-            CHECK_FUNCTION_EXISTS(jpeg_read_header LIBJPEG_IS_GOOD)
-         endif()
-         if (JPEG_FOUND AND LIBJPEG_IS_GOOD AND NOT APPLE)
+         include(cmake_utils/find_libjpeg.cmake)
+         if (JPEG_FOUND)
             include_directories(${JPEG_INCLUDE_DIR})
             set (dlib_needed_libraries ${dlib_needed_libraries} ${JPEG_LIBRARY})
          else()
@@ -526,6 +555,13 @@ if (NOT TARGET dlib)
 
 
       if (DLIB_USE_BLAS OR DLIB_USE_LAPACK OR DLIB_USE_MKL_FFT)
+         if (DLIB_USE_MKL_WITH_TBB AND DLIB_USE_MKL_SEQUENTIAL)
+            set(DLIB_USE_MKL_SEQUENTIAL OFF CACHE STRING ${DLIB_USE_MKL_SEQUENTIAL_STR} FORCE )
+            toggle_preprocessor_switch(DLIB_USE_MKL_SEQUENTIAL)
+            message(STATUS "Disabling DLIB_USE_MKL_SEQUENTIAL. It cannot be used simultaneously with DLIB_USE_MKL_WITH_TBB.")
+         endif()
+
+
          # Try to find BLAS, LAPACK and MKL
          include(cmake_utils/find_blas.cmake)
 
@@ -569,6 +605,12 @@ if (NOT TARGET dlib)
       if (DLIB_USE_CUDA)
          find_package(CUDA 7.5)
 
+         if (CUDA_VERSION VERSION_GREATER 9.1 AND CMAKE_VERSION VERSION_LESS 3.12.2)
+            # This bit of weirdness is to work around a bug in cmake 
+            list(REMOVE_ITEM CUDA_CUBLAS_LIBRARIES "CUDA_cublas_device_LIBRARY-NOTFOUND")
+         endif()
+
+
          if (CUDA_FOUND AND MSVC AND NOT CUDA_CUBLAS_LIBRARIES AND "${CMAKE_SIZEOF_VOID_P}" EQUAL "4")
             message(WARNING "You have CUDA installed, but we can't use it unless you put visual studio in 64bit mode.")
             set(CUDA_FOUND 0)
@@ -585,6 +627,12 @@ if (NOT TARGET dlib)
                # Grab all the -D flags from CMAKE_CXX_FLAGS so we can pass them
                # to nvcc.
                string(REGEX MATCHALL "-D[^ ]*" FLAGS_FOR_NVCC "${CMAKE_CXX_FLAGS}")
+
+               # Check if we are being built as part of a pybind11 module. 
+               if (COMMAND pybind11_add_module)
+                  # Don't export unnecessary symbols.
+                  list(APPEND FLAGS_FOR_NVCC "-Xcompiler=-fvisibility=hidden")
+               endif()
             endif()
 
 
@@ -594,6 +642,9 @@ if (NOT TARGET dlib)
             # linux).
             list(APPEND CUDA_NVCC_FLAGS "-arch=sm_30;-D__STRICT_ANSI__;-D_MWAITXINTRIN_H_INCLUDED;-D_FORCE_INLINES;${FLAGS_FOR_NVCC}")
             list(APPEND CUDA_NVCC_FLAGS ${active_preprocessor_switches})
+            if (NOT DLIB_IN_PROJECT_BUILD)
+               LIST(APPEND CUDA_NVCC_FLAGS -DDLIB__CMAKE_GENERATED_A_CONFIG_H_FILE)
+            endif()
             if (NOT MSVC)
                list(APPEND CUDA_NVCC_FLAGS "-std=c++11")
             endif()
@@ -649,16 +700,34 @@ if (NOT TARGET dlib)
             endif()
 
             # Find where cuSOLVER is since the FindCUDA cmake package doesn't
-            # bother to look for it.
-            get_filename_component(cuda_blas_path "${CUDA_CUBLAS_LIBRARIES}" DIRECTORY)
-            find_library(cusolver cusolver HINTS ${cuda_blas_path})
-            mark_as_advanced(cusolver)
+            # bother to look for it in older versions of cmake.
+            if (NOT CUDA_cusolver_LIBRARY)
+               get_filename_component(cuda_blas_path "${CUDA_CUBLAS_LIBRARIES}" DIRECTORY)
+               find_library(CUDA_cusolver_LIBRARY cusolver HINTS ${cuda_blas_path})
+               # CUDA 10.1 doesn't install symbolic links to libcusolver.so in
+               # the usual place.  This is probably a bug in the cuda
+               # installer.  In any case, If we haven't found cusolver yet go
+               # look in the cuda install folder for it.  New versions of cmake
+               # do this correctly, but older versions need help.
+               if (NOT CUDA_cusolver_LIBRARY)
+                  find_library(CUDA_cusolver_LIBRARY cusolver HINTS 
+                     /usr/local/cuda/lib64/
+                     )
+               endif()
+               mark_as_advanced(CUDA_cusolver_LIBRARY)
+            endif()
             # Also find OpenMP since cuSOLVER needs it.  Importantly, we only
             # look for one to link to if our use of BLAS, specifically the
             # Intel MKL, hasn't already decided what to use.  This is because
             # it makes the MKL bug out if you link to another openmp lib other
-            # than Intel's when you use the MKL.
-            if (NOT openmp_libraries AND NOT MSVC AND NOT XCODE)
+            # than Intel's when you use the MKL. I'm also not really sure when
+            # explicit linking to openmp became unnecessary, but for
+            # sufficiently older versions of cuda it was needed.  Then in
+            # versions of cmake newer than 3.11 linking to openmp started to
+            # mess up the switches passed to nvcc, so you can't just leave
+            # these "try to link to openmp" statements here going forward.  Fun
+            # times.
+            if (CUDA_VERSION VERSION_LESS "9.1" AND NOT openmp_libraries AND NOT MSVC AND NOT XCODE AND NOT APPLE)
                find_package(OpenMP)
                if (OPENMP_FOUND)
                   set(openmp_libraries ${OpenMP_CXX_FLAGS}) 
@@ -683,7 +752,7 @@ if (NOT TARGET dlib)
                ${CUDA_CUBLAS_LIBRARIES} 
                ${cudnn}
                ${CUDA_curand_LIBRARY}
-               ${cusolver}
+               ${CUDA_cusolver_LIBRARY}
                )
             if(openmp_libraries)
                list(APPEND dlib_needed_libraries ${openmp_libraries})
@@ -696,6 +765,9 @@ if (NOT TARGET dlib)
             toggle_preprocessor_switch(DLIB_USE_CUDA)
             if (USING_OLD_VISUAL_STUDIO_COMPILER)
                message(STATUS "*** Dlib CUDA support requires C++11 but your compiler doesn't support it. ***")
+            endif()
+            if (NOT CUDA_FOUND)
+               message(STATUS "DID NOT FIND CUDA")
             endif()
             message(STATUS "Disabling CUDA support for dlib.  DLIB WILL NOT USE CUDA")
          endif()
@@ -801,8 +873,21 @@ if (NOT TARGET dlib)
          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
       install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dlib
-         FILES_MATCHING PATTERN "*.h" PATTERN "*.cmake"
-         REGEX "${CMAKE_CURRENT_BINARY_DIR}" EXCLUDE)
+         FILES_MATCHING 
+            PATTERN "*.h" 
+            PATTERN "*.cmake"
+            PATTERN "*_tutorial.txt"
+            PATTERN "cassert"
+            PATTERN "cstring"
+            PATTERN "fstream"
+            PATTERN "iomanip"
+            PATTERN "iosfwd"
+            PATTERN "iostream"
+            PATTERN "istream"
+            PATTERN "locale"
+            PATTERN "ostream"
+            PATTERN "sstream"
+            REGEX "${CMAKE_CURRENT_BINARY_DIR}" EXCLUDE)
 
 
       configure_file(${PROJECT_SOURCE_DIR}/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/config.h)
@@ -839,6 +924,11 @@ if (NOT TARGET dlib)
       install(FILES "${CMAKE_CURRENT_BINARY_DIR}/dlib-1.pc"
          DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
 
+      # Add a cpack "package" target. This will create an archive containing
+      # the built library file, the header files, and cmake and pkgconfig
+      # configuration files.
+      include(CPack)
+
    endif()
 
 endif()
@@ -855,6 +945,13 @@ if (MSVC)
    set_target_properties(dlib PROPERTIES RELEASE_POSTFIX "${VERSION}_release_${numbits}bit_msvc${MSVC_VERSION}")
    set_target_properties(dlib PROPERTIES MINSIZEREL_POSTFIX "${VERSION}_minsizerel_${numbits}bit_msvc${MSVC_VERSION}")
    set_target_properties(dlib PROPERTIES RELWITHDEBINFO_POSTFIX "${VERSION}_relwithdebinfo_${numbits}bit_msvc${MSVC_VERSION}")
+endif()
+
+# Check if we are being built as part of a pybind11 module. 
+if (COMMAND pybind11_add_module)
+   # Don't export unnecessary symbols.
+   set_target_properties(dlib PROPERTIES CXX_VISIBILITY_PRESET "hidden")
+   set_target_properties(dlib PROPERTIES CUDA_VISIBILITY_PRESET "hidden")
 endif()
 
 add_library(dlib::dlib ALIAS dlib)
